@@ -1,0 +1,546 @@
+# -*- coding: utf-8 -*-
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.stats import norm, weibull_min, kstest
+import warnings
+import os
+
+warnings.filterwarnings('ignore')
+
+# 한글 폰트 설정
+try:
+    plt.rcParams['font.family'] = 'Malgun Gothic'
+    plt.rcParams['axes.unicode_minus'] = False
+except:
+    plt.rcParams['font.family'] = 'DejaVu Sans'
+    plt.rcParams['axes.unicode_minus'] = False
+
+class EnhancedClaimPredictor:
+    def __init__(self):
+        self.raw_data = None
+        self.prediction_results = None
+        self.distribution_params = {}
+        self.warranty_months = None
+        self.prediction_start_month = None
+        self.distribution_type = 'normal'
+        self.seasonal_factors = {}
+        self.validation_results = {}
+        
+    def load_from_excel(self, file_path):
+        """엑셀 파일에서 데이터 로드"""
+        try:
+            df = pd.read_excel(file_path)
+            return self._process_data(df)
+        except Exception as e:
+            print(f"엑셀 파일 로드 오류: {e}")
+            return None
+    
+    def load_from_clipboard(self):
+        """클립보드에서 데이터 로드"""
+        try:
+            df = pd.read_clipboard()
+            return self._process_data(df)
+        except Exception as e:
+            print(f"클립보드 데이터 로드 오류: {e}")
+            return None
+    
+    def _process_data(self, df):
+        """데이터 전처리"""
+        df.columns = df.columns.str.strip()
+        
+        column_map = {
+            '판매월': ['판매월', 'sale_month', 'sales_month'],
+            '수리월': ['수리월', 'repair_month', '수리'],  
+            '건수': ['건수', 'count', 'cnt', '수량']
+        }
+        
+        for target, candidates in column_map.items():
+            for col in df.columns:
+                if col in candidates:
+                    df = df.rename(columns={col: target})
+                    break
+        
+        required = ['판매월', '수리월', '건수']
+        if not all(col in df.columns for col in required):
+            print(f"필요한 컬럼: {required}")
+            print(f"현재 컬럼: {list(df.columns)}")
+            return None
+        
+        df['판매월'] = pd.to_numeric(df['판매월'], errors='coerce')
+        df['수리월'] = pd.to_numeric(df['수리월'], errors='coerce')
+        df['건수'] = pd.to_numeric(df['건수'], errors='coerce')
+        
+        df = df.dropna()
+        self.raw_data = df
+        print(f"데이터 로드 완료: {len(df)}건")
+        return df
+    
+    def calculate_usage_months(self, sales_month, repair_month):
+        """사용개월 계산"""
+        sales_year = 2000 + sales_month // 100
+        sales_mon = sales_month % 100
+        repair_year = 2000 + repair_month // 100
+        repair_mon = repair_month % 100
+        
+        return (repair_year - sales_year) * 12 + (repair_mon - sales_mon)
+    
+    def analyze_seasonal_factors(self):
+        """계절성 요인 분석"""
+        if self.raw_data is None:
+            return
+        
+        self.raw_data['사용개월'] = self.raw_data.apply(
+            lambda row: self.calculate_usage_months(row['판매월'], row['수리월']), axis=1
+        )
+        
+        self.raw_data['수리_월'] = self.raw_data['수리월'] % 100
+        monthly_claims = self.raw_data.groupby('수리_월')['건수'].sum()
+        
+        overall_avg = monthly_claims.mean()
+        self.seasonal_factors = (monthly_claims / overall_avg).to_dict()
+        
+        print("계절성 요인 분석 완료")
+    
+    def set_parameters(self, warranty_months, prediction_start_month, distribution_type='normal', 
+                      shape=None, scale=None, mu=None, sigma=None, loc=None):
+        """분석 파라미터 설정"""
+        self.warranty_months = warranty_months
+        self.prediction_start_month = prediction_start_month
+        self.distribution_type = distribution_type
+        
+        if distribution_type == 'weibull' and shape is not None and scale is not None:
+            self.distribution_params = {
+                'shape': shape, 
+                'scale': scale, 
+                'loc': loc if loc is not None else 0
+            }
+        elif distribution_type == 'normal' and mu is not None and sigma is not None:
+            self.distribution_params = {'mu': mu, 'sigma': sigma}
+        else:
+            self._estimate_distribution_params()
+        
+        print(f"분석 설정 완료:")
+        print(f"- 보증기간: {warranty_months}개월")
+        print(f"- 예측시작월: {prediction_start_month}")
+        print(f"- 분포 타입: {distribution_type}")
+        print(f"- 분포 파라미터: {self.distribution_params}")
+    
+    def _estimate_distribution_params(self):
+        """분포 파라미터 자동 추정"""
+        if self.raw_data is None:
+            if self.distribution_type == 'normal':
+                self.distribution_params = {'mu': self.warranty_months * 0.5, 'sigma': self.warranty_months * 0.2}
+            else:
+                self.distribution_params = {'shape': 2.0, 'scale': self.warranty_months * 0.6, 'loc': 0}
+            return
+        
+        completed_data = []
+        for _, row in self.raw_data.iterrows():
+            usage_months = self.calculate_usage_months(row['판매월'], row['수리월'])
+            sales_to_prediction = self.calculate_usage_months(row['판매월'], self.prediction_start_month)
+            
+            if sales_to_prediction >= self.warranty_months:
+                completed_data.append({
+                    'usage_months': usage_months,
+                    'count': row['건수']
+                })
+        
+        if not completed_data:
+            print("보증기간 완료 데이터가 없어 기본값을 사용합니다.")
+            if self.distribution_type == 'normal':
+                self.distribution_params = {'mu': self.warranty_months * 0.5, 'sigma': self.warranty_months * 0.2}
+            else:
+                self.distribution_params = {'shape': 2.0, 'scale': self.warranty_months * 0.6, 'loc': 0}
+            return
+        
+        usage_months = [d['usage_months'] for d in completed_data]
+        weights = [d['count'] for d in completed_data]
+        
+        if self.distribution_type == 'weibull':
+            try:
+                expanded_data = []
+                for usage, weight in zip(usage_months, weights):
+                    expanded_data.extend([usage] * int(weight))
+                
+                params = weibull_min.fit(expanded_data, floc=0)
+                shape, loc, scale = params
+                self.distribution_params = {'shape': shape, 'scale': scale, 'loc': loc}
+            except:
+                print("와이불 분포 추정 실패, 정규분포로 변경합니다.")
+                self.distribution_type = 'normal'
+                weighted_mean = np.average(usage_months, weights=weights)
+                weighted_var = np.average((np.array(usage_months) - weighted_mean)**2, weights=weights)
+                self.distribution_params = {'mu': weighted_mean, 'sigma': np.sqrt(weighted_var)}
+        else:
+            weighted_mean = np.average(usage_months, weights=weights)
+            weighted_var = np.average((np.array(usage_months) - weighted_mean)**2, weights=weights)
+            self.distribution_params = {'mu': weighted_mean, 'sigma': np.sqrt(weighted_var)}
+    
+    def get_probability_density(self, months_range):
+        """확률밀도 계산"""
+        if self.distribution_type == 'weibull':
+            shape = self.distribution_params['shape']
+            scale = self.distribution_params['scale']
+            loc = self.distribution_params.get('loc', 0)
+            pdf_values = weibull_min.pdf(months_range, shape, loc=loc, scale=scale)
+        else:
+            mu = self.distribution_params['mu']
+            sigma = self.distribution_params['sigma']
+            pdf_values = norm.pdf(months_range, mu, sigma)
+        
+        valid_range = months_range <= self.warranty_months
+        pdf_values = pdf_values * valid_range
+        
+        total_prob = np.sum(pdf_values)
+        if total_prob > 0:
+            pdf_values = pdf_values / total_prob
+        
+        return pdf_values
+    
+    def apply_seasonal_adjustment(self, repair_month, predicted_count):
+        """계절성 조정 적용"""
+        if not self.seasonal_factors:
+            return predicted_count
+        
+        month = repair_month % 100
+        seasonal_factor = self.seasonal_factors.get(month, 1.0)
+        return predicted_count * seasonal_factor
+    
+    def predict_claims(self):
+        """클레임 예측 실행"""
+        if self.raw_data is None:
+            print("먼저 데이터를 로드하세요.")
+            return None
+        
+        self.analyze_seasonal_factors()
+        
+        self.raw_data['사용개월'] = self.raw_data.apply(
+            lambda row: self.calculate_usage_months(row['판매월'], row['수리월']), axis=1
+        )
+        
+        all_sales_months = sorted(self.raw_data['판매월'].unique())
+        predictions = []
+        
+        for sales_month in all_sales_months:
+            current_claims = self.raw_data[self.raw_data['판매월'] == sales_month]['건수'].sum()
+            
+            if current_claims == 0:
+                continue
+            
+            current_usage = self.calculate_usage_months(sales_month, self.prediction_start_month)
+            
+            if current_usage >= self.warranty_months:
+                continue
+            
+            months_range = np.arange(0, self.warranty_months + 1)
+            pdf_values = self.get_probability_density(months_range)
+            
+            if current_usage >= 0:
+                cumulative_prob = np.sum(pdf_values[:current_usage + 1])
+            else:
+                cumulative_prob = 0
+            
+            if cumulative_prob > 0:
+                total_expected = current_claims / cumulative_prob
+                remaining_claims = total_expected - current_claims
+                
+                future_months = months_range[current_usage + 1:]
+                future_pdf = pdf_values[current_usage + 1:]
+                
+                if len(future_months) > 0 and np.sum(future_pdf) > 0:
+                    future_pdf_norm = future_pdf / np.sum(future_pdf)
+                    
+                    for i, month_usage in enumerate(future_months):
+                        repair_month = self._add_months(sales_month, month_usage)
+                        predicted_count = remaining_claims * future_pdf_norm[i]
+                        
+                        adjusted_count = self.apply_seasonal_adjustment(repair_month, predicted_count)
+                        
+                        if adjusted_count > 0.1:
+                            predictions.append({
+                                '판매월': sales_month,
+                                '수리월': repair_month,
+                                '예측건수': adjusted_count
+                            })
+        
+        self.prediction_results = pd.DataFrame(predictions)
+        print(f"예측 완료: {len(predictions)}건의 예측 데이터 생성")
+        return self.prediction_results
+    
+    def _add_months(self, yymm, months_to_add):
+        """YYMM에 개월수 추가"""
+        year = 2000 + yymm // 100
+        month = yymm % 100
+        
+        total_months = year * 12 + month - 1 + months_to_add
+        new_year = total_months // 12
+        new_month = (total_months % 12) + 1
+        
+        new_yy = new_year - 2000
+        return new_yy * 100 + new_month
+    
+    def create_monthly_summary(self):
+        """월별 집계표 생성"""
+        all_months = set(self.raw_data['판매월']) | set(self.raw_data['수리월'])
+        if self.prediction_results is not None and len(self.prediction_results) > 0:
+            all_months = all_months | set(self.prediction_results['수리월'])
+        
+        all_months = sorted(list(all_months))
+        
+        result = []
+        for month in all_months:
+            sales_actual = self.raw_data[self.raw_data['판매월'] == month]['건수'].sum()
+            sales_predicted = 0
+            if self.prediction_results is not None and len(self.prediction_results) > 0:
+                sales_predicted = self.prediction_results[self.prediction_results['판매월'] == month]['예측건수'].sum()
+            
+            repair_actual = self.raw_data[self.raw_data['수리월'] == month]['건수'].sum()
+            repair_predicted = 0
+            if self.prediction_results is not None and len(self.prediction_results) > 0:
+                repair_predicted = self.prediction_results[self.prediction_results['수리월'] == month]['예측건수'].sum()
+            
+            seasonal_factor = self.seasonal_factors.get(month % 100, 1.0)
+            
+            if sales_actual > 0 or sales_predicted > 0 or repair_actual > 0 or repair_predicted > 0:
+                result.append({
+                    '기간': int(month),
+                    '판매월건수': int(sales_actual),
+                    '판매월예측건수': int(sales_predicted),
+                    '기발생건수': int(repair_actual),
+                    '향후예측건수': int(repair_predicted),
+                    '계절성요인': round(seasonal_factor, 2)
+                })
+        
+        return pd.DataFrame(result)
+    
+    def plot_results(self):
+        """향상된 그래프 생성"""
+        monthly_summary = self.create_monthly_summary()
+        
+        if len(monthly_summary) == 0:
+            print("그래프를 그릴 데이터가 없습니다.")
+            return
+        
+        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(20, 12))
+        
+        # 1. 메인 예측 그래프
+        x_labels = monthly_summary['기간'].astype(str)
+        x_pos = range(len(x_labels))
+        
+        bar_width = 0.6
+        bottom_data = monthly_summary['판매월건수']
+        top_data = monthly_summary['판매월예측건수']
+        
+        bars1 = ax1.bar(x_pos, bottom_data, width=bar_width, 
+                       label='기판매월 건수', color='lightblue', alpha=0.7)
+        bars2 = ax1.bar(x_pos, top_data, width=bar_width, bottom=bottom_data,
+                       label='판매월 예측건수', color='lightgray', alpha=0.7)
+        
+        ax1_twin = ax1.twinx()
+        
+        repair_actual_nonzero = monthly_summary[monthly_summary['기발생건수'] > 0]
+        repair_predicted_nonzero = monthly_summary[monthly_summary['향후예측건수'] > 0]
+        
+        if len(repair_actual_nonzero) > 0:
+            actual_x_pos = [x_pos[i] for i in repair_actual_nonzero.index]
+            actual_y_data = repair_actual_nonzero['기발생건수']
+            ax1_twin.plot(actual_x_pos, actual_y_data, 
+                         color='green', linewidth=2, marker='o', markersize=3,
+                         label='기발생 건수')
+        
+        if len(repair_predicted_nonzero) > 0:
+            predicted_x_pos = [x_pos[i] for i in repair_predicted_nonzero.index]
+            predicted_y_data = repair_predicted_nonzero['향후예측건수']
+            ax1_twin.plot(predicted_x_pos, predicted_y_data, 
+                         color='red', linewidth=2, marker='o', markersize=3,
+                         label='향후 예측 건수')
+        
+        ax1.set_title('필드 클레임 예측 분석 결과')
+        ax1.set_xlabel('기간')
+        ax1.set_ylabel('판매월 클레임 건수 (막대)')
+        ax1_twin.set_ylabel('수리월 클레임 건수 (선)')
+        
+        # x축 라벨 설정 (핵심 수정)
+        step = max(1, len(x_labels) // 20)
+        ax1.set_xticks([i for i in range(0, len(x_labels), step)])
+        ax1.set_xticklabels([x_labels[i] for i in range(0, len(x_labels), step)], 
+                           rotation=45, ha='right')
+        
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax1_twin.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
+        ax1.grid(True, alpha=0.3)
+        
+        # 2. 분포 곡선 그래프
+        months_range = np.arange(0, self.warranty_months + 1)
+        pdf_values = self.get_probability_density(months_range)
+        
+        ax2.plot(months_range, pdf_values, 'b-', linewidth=2, 
+                label=f'{self.distribution_type.title()} 분포')
+        ax2.fill_between(months_range, 0, pdf_values, alpha=0.3)
+        ax2.set_title('클레임 발생 확률 분포')
+        ax2.set_xlabel('사용 개월')
+        ax2.set_ylabel('확률 밀도')
+        ax2.grid(True, alpha=0.3)
+        ax2.legend()
+        
+        # 3. 계절성 요인 그래프
+        if self.seasonal_factors:
+            months = list(range(1, 13))
+            factors = [self.seasonal_factors.get(m, 1.0) for m in months]
+            
+            ax3.bar(months, factors, color='orange', alpha=0.7)
+            ax3.axhline(y=1.0, color='red', linestyle='--', alpha=0.5)
+            ax3.set_title('월별 계절성 요인')
+            ax3.set_xlabel('월')
+            ax3.set_ylabel('계절성 배수')
+            ax3.set_xticks(months)
+            ax3.grid(True, alpha=0.3)
+        
+        # 4. 빈 공간 (추후 확장 가능)
+        ax4.text(0.5, 0.5, '추가 분석 공간', ha='center', va='center', 
+                transform=ax4.transAxes, fontsize=16)
+        ax4.set_title('추가 분석')
+        
+        plt.tight_layout()
+        plt.show()
+        
+        return fig
+    
+    def export_to_excel(self, output_dir, filename):
+        """엑셀 파일 저장"""
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        
+        full_path = os.path.join(output_dir, filename)
+        monthly_summary = self.create_monthly_summary()
+        
+        with pd.ExcelWriter(full_path, engine='openpyxl') as writer:
+            monthly_summary.to_excel(writer, sheet_name='월별집계표', index=False)
+            
+            if '사용개월' in self.raw_data.columns:
+                self.raw_data.to_excel(writer, sheet_name='원본데이터', index=False)
+            
+            if self.prediction_results is not None and len(self.prediction_results) > 0:
+                self.prediction_results.to_excel(writer, sheet_name='예측데이터', index=False)
+            
+            settings_data = [{
+                '보증기간': self.warranty_months,
+                '예측시작월': self.prediction_start_month,
+                '분포타입': self.distribution_type
+            }]
+            
+            for key, value in self.distribution_params.items():
+                settings_data[0][f'분포_{key}'] = value
+            
+            settings = pd.DataFrame(settings_data)
+            settings.to_excel(writer, sheet_name='분석설정', index=False)
+            
+            if self.seasonal_factors:
+                seasonal_df = pd.DataFrame([
+                    {'월': month, '계절성요인': factor} 
+                    for month, factor in sorted(self.seasonal_factors.items())
+                ])
+                seasonal_df.to_excel(writer, sheet_name='계절성요인', index=False)
+        
+        print(f"엑셀 파일 저장: {full_path}")
+        return full_path
+
+def main():
+    """메인 실행 함수"""
+    predictor = EnhancedClaimPredictor()
+    
+    print("=== 필드 클레임 예측 시스템 ===")
+    
+    # 1. 데이터 입력
+    print("\n1. 데이터 입력 방법 선택:")
+    print("1) 엑셀 파일")
+    print("2) 클립보드 (엑셀에서 복사)")
+    
+    choice = input("선택 (1-2): ").strip()
+    
+    if choice == '1':
+        file_path = input("엑셀 파일 경로: ").strip()
+        data = predictor.load_from_excel(file_path)
+    else:
+        print("엑셀에서 데이터를 복사한 후 Enter를 누르세요.")
+        input("준비되면 Enter...")
+        data = predictor.load_from_clipboard()
+    
+    if data is None:
+        print("데이터 로드 실패")
+        return
+    
+    # 2. 분석 파라미터 입력
+    print("\n2. 분석 파라미터 입력:")
+    warranty_months = int(input("보증기간 (개월, 예: 180): ") or "180")
+    prediction_start_month = int(input("예측시작월 (YYMM, 예: 202508): ") or "202508")
+    
+    # 분포 타입 선택
+    print("\n3. 분포 타입 선택:")
+    print("1) 정규분포")
+    print("2) 와이블분포")
+    print("3) 자동 선택")
+    
+    dist_choice = input("선택 (1-3): ").strip()
+    
+    if dist_choice == '1':
+        distribution_type = 'normal'
+        mu = float(input("평균 사용개월 (예: 80): ") or "80")
+        sigma = float(input("표준편차 (예: 33): ") or "33")
+        predictor.set_parameters(warranty_months, prediction_start_month, 
+                               distribution_type, mu=mu, sigma=sigma)
+    elif dist_choice == '2':
+        distribution_type = 'weibull'
+        shape = float(input("형태 모수 (shape, 예: 2.5): ") or "2.5")
+        scale = float(input("척도 모수 (scale, 예: 42): ") or "42")
+        loc = float(input("위치 모수 (loc, 예: 4): ") or "4")
+        predictor.set_parameters(warranty_months, prediction_start_month, 
+                               distribution_type, shape=shape, scale=scale, loc=loc)
+    else:
+        print("데이터 기반으로 자동 선택합니다...")
+        predictor.set_parameters(warranty_months, prediction_start_month, 'weibull')
+    
+    # 4. 예측 실행
+    print("\n4. 클레임 예측 실행 중...")
+    predictor.predict_claims()
+    
+    # 5. 월별 집계표 미리보기
+    print("\n5. 월별 집계표 (상위 10개):")
+    monthly_summary = predictor.create_monthly_summary()
+    print(monthly_summary.head(10).to_string(index=False))
+    
+    # 6. 그래프 표시
+    graph_choice = input("\n6. 분석 그래프를 표시하시겠습니까? (y/n): ").strip().lower()
+    if graph_choice == 'y':
+        try:
+            print("그래프 생성 중...")
+            predictor.plot_results()
+            print("그래프 생성 완료!")
+        except Exception as e:
+            print(f"그래프 생성 오류: {e}")
+    
+    # 7. 엑셀 저장
+    print("\n7. 엑셀 파일 저장...")
+    output_dir = r"C:\Users\kitae.hong\Documents\파이썬\출력데이터"
+    filename = f"클레임예측_{prediction_start_month}_{warranty_months}개월_{predictor.distribution_type}.xlsx"
+    
+    try:
+        predictor.export_to_excel(output_dir, filename)
+        print(f"\n엑셀 저장 완료! 파일 위치: {output_dir}\\{filename}")
+    except Exception as e:
+        print(f"엑셀 저장 오류: {e}")
+        desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+        try:
+            predictor.export_to_excel(desktop, filename)
+            print(f"바탕화면에 저장: {desktop}\\{filename}")
+        except Exception as e2:
+            print(f"바탕화면 저장도 실패: {e2}")
+    
+    print(f"\n완료!")
+    
+    return predictor
+
+if __name__ == "__main__":
+    predictor = main()
